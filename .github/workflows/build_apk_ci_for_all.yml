@@ -1,4 +1,4 @@
-name: Build and Export APK
+name: Build and Export APK For All
 
 on:
   workflow_dispatch:
