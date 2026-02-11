@@ -21,4 +21,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "pipelineApp"
 include(":app")
- 
+include(":data")
+include(":domain")
