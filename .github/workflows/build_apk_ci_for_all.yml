@@ -11,7 +11,6 @@ jobs:
       fail-fast: false
       matrix:
         flavor:
-          - two_d
           - amtel
           - boost
           - digicel
@@ -25,7 +24,6 @@ jobs:
           - tmobile
           - us
           - verizon
-          - verizon_acc
           - vzw
           - xfinity
           - aio

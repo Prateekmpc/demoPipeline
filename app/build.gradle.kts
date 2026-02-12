@@ -106,7 +106,6 @@ android {
 
         val carriers = listOf(
             "Verizon",
-            "Verizon_ACC",
             "TMobile",
             "O2",
             "Boost",
@@ -118,7 +117,6 @@ android {
             "RW",
             "Team",
             "Xfinity",
-            "Two_D",
             "Digicel",
             "Nadiya",
             "Amtel",
