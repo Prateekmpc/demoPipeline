@@ -1,0 +1,47 @@
+name: Tag Policy
+
+on:
+  push:
+    tags:
+      - '**'
+
+jobs:
+  tag_policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Enforce tag format (lowercase + rc/r)
+        run: |
+          ref="${{ github.ref_name }}"
+          [[ "$ref" == "${ref,,}" ]] || { echo "Tags must be lowercase"; exit 1; }
+          [[ "$ref" =~ ^[a-z0-9._+-]+-[0-9]+\.[0-9]+-(rc[0-9]+|r[0-9]+)$ ]] || {
+            echo "Invalid tag '$ref'. Use <slug>-<major>.<minor>-rcN or -rN"; exit 1; }
+
+      - name: RC must be reachable from release/<slug>/<ver>
+        if: ${{ contains(github.ref_name, '-rc') }}
+        run: |
+          ref="${{ github.ref_name }}"
+          slug="${ref%-*-*}"; ver="${ref#${slug}-}"; ver="${ver%-*}"
+          rel="release/${slug}/${ver}"
+          git fetch origin "$rel" --depth=1 || { echo "Missing branch $rel"; exit 1; }
+          sha_tag=$(git rev-list -n1 "$ref")
+          git merge-base --is-ancestor "$sha_tag" "origin/$rel" || {
+            echo "Tag $ref is not reachable from $rel"; exit 1; }
+
+      - name: GA must be reachable from prod/<slug>-latest
+        if: ${{ !contains(github.ref_name, '-rc') }}
+        run: |
+          ref="${{ github.ref_name }}"
+          slug="${ref%-*-*}"; ver="${ref#${slug}-}"; ver="${ver%-*}"
+          prod="prod/${slug}-latest"
+          git fetch origin "$prod" --depth=1 || { echo "Missing branch $prod"; exit 1; }
+          sha_tag=$(git rev-list -n1 "$ref")
+          git merge-base --is-ancestor "$sha_tag" "origin/$prod" || {
+            echo "Tag $ref is not reachable from $prod"; exit 1; }
+
+      - name: Require annotated tags (no lightweight)
+        run: |
+          objtype=$(git cat-file -t "$GITHUB_REF")
+          [[ "$objtype" == "tag" ]] || { echo "Tag must be annotated"; exit 1; }

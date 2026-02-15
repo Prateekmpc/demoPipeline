@@ -1,0 +1,1319 @@
+name: Policy & Build
+
+on:
+  pull_request:
+    branches: ['**']
+  push:
+    tags: ['**']  # tag naming enforced below
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  branch_naming:
+    name: Enforce branch naming
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        shell: bash
+        run: |
+          n="${{ github.head_ref }}"
+          # Push/tag events have no head_ref
+          if [[ -z "$n" ]]; then
+            echo "No head_ref (push/tag); skipping."; exit 0
+          fi
+
+          # Exempt long-lived branches from Jira key requirement (change if you want)
+          if [[ "$n" =~ ^(release|prod|qa)/ ]]; then
+            echo "release/prod/qa branch; Jira key check skipped."; exit 0
+          fi
+
+          # Disallow synonyms; enforce Conventional Commits prefixes
+          if [[ "$n" =~ ^(features?|bug|bugfix)/ ]]; then
+            echo "::error title=Branch naming policy::Use 'feat/' not 'feature(s)/'; use 'fix/' not 'bug' or 'bugfix'. See https://www.conventionalcommits.org/en/v1.0.0/"
+            {
+              echo "### ❌ Branch naming failed"
+              echo "- **Branch:** \`$n\`"
+              echo "- Use \`feat/\`, \`fix/\`, \`hotfix/\`, \`chore/\`, \`release/\`, \`docs/\`, \`style/\`, \`refactor/\`, \`perf/\`, \`test/\`, \`build/\`, \`ci/\`"
+              echo "- See: https://www.conventionalcommits.org/en/v1.0.0/"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Allowed prefixes (Conventional Commits types)
+          if [[ ! "$n" =~ ^(feat|fix|hotfix|chore|release|docs|style|refactor|perf|test|build|ci)/ ]]; then
+            echo "::error title=Branch naming policy::Branch must start with a Conventional Commits type (e.g., feat/, fix/, chore/, release/, docs/ …). See https://www.conventionalcommits.org/en/v1.0.0/"
+            {
+              echo "### ❌ Branch naming failed"
+              echo "- **Branch:** \`$n\`"
+              echo "- Must start with one of: \`feat/\`, \`fix/\`, \`hotfix/\`, \`chore/\`, \`release/\`, \`docs/\`, \`style/\`, \`refactor/\`, \`perf/\`, \`test/\`, \`build/\`, \`ci/\`"
+              echo "- See: https://www.conventionalcommits.org/en/v1.0.0/"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Require uppercase Jira key DAIS-#### somewhere in the branch, delimited by /, -, _, or end
+          if [[ ! "$n" =~ (^|/)DAIS-[0-9]+([/_-]|$) ]]; then
+            echo "Branch must include Jira key like 'DAIS-1234'."; exit 1
+          fi
+
+          # Guard common mistakes
+          if [[ "$n" =~ dais-[0-9]+ ]]; then
+            echo "Project key must be uppercase: DAIS-1234"; exit 1
+          fi
+          if [[ "$n" =~ DAIS_[0-9]+ ]]; then
+            echo "Use a hyphen in the Jira key: DAIS-1234, not DAIS_1234"; exit 1
+          fi
+
+  pr_base_policy:
+    name: Enforce PR base policy
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only allow prod/*-latest PRs from release/* with matching build type
+        shell: bash
+        run: |
+          base="${{ github.base_ref }}" 
+          head="${{ github.head_ref }}"
+
+          # Only care when base is prod/*-latest
+          if [[ ! "$base" =~ ^prod/.+-latest$ ]]; then
+            echo "Base is not prod/*-latest; skipping."; exit 0
+          fi
+
+          # Must come from a release/* branch
+          if [[ ! "$head" =~ ^release/.+ ]]; then
+            echo "Only release/* branches may target $base"; exit 1
+          fi
+
+          # Extract build types:
+          build_type_base="${base#prod/}"; build_type_base="${build_type_base%-latest}"
+          build_type_head="$(echo "$head" | cut -d/ -f2)"
+
+          if [[ "$build_type_base" != "$build_type_head" ]]; then
+            echo "Build type mismatch: release build type '$build_type_head' must match prod build type '$build_type_base'"; exit 1
+          fi
+
+  pr_title_contains_jira:
+    name: PR title must contain Jira key
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title for DAIS-#### key
+        shell: bash
+        run: |
+          title="${{ github.event.pull_request.title }}"
+          if [[ -z "$title" ]]; then
+            echo "::error title=PR title policy::PR title is empty"
+            exit 1
+          fi
+
+          # Normalize: uppercase + turn spaces/underscores into hyphens
+          norm="$(echo "$title" | tr '[:lower:]' '[:upper:]' | sed -E 's/[ _]+/-/g')"
+
+          if [[ ! "$norm" =~ DAIS-[0-9]+ ]]; then
+            echo "::error title=PR title policy::PR title must include Jira key like 'DAIS-1234'. Current: '$title'"
+            {
+              echo "### ❌ PR title failed policy"
+              echo "- **Title:** \`$title\`"
+              echo "- Include an uppercase Jira key like \`DAIS-1234\` (e.g., \`fix: DAIS-1309 …\`)."
+              echo "- See: https://www.conventionalcommits.org/en/v1.0.0/"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  require_version_and_changelog:
+    name: Require version & changelog on release → prod
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+          fetch-depth: 0
+      - name: Enforce only when base is prod/*-latest and head is release/* with matching build type
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.base_ref }}"
+          head="${{ github.head_ref }}"
+
+          if [[ ! "$base" =~ ^prod/.+-latest$ || ! "$head" =~ ^release/.+ ]]; then
+            echo "Not a release → prod/*-latest PR; skipping."; exit 0
+          fi
+
+          build_type_base="${base#prod/}"; build_type_base="${build_type_base%-latest}"
+          build_type_head="$(echo "$head" | cut -d/ -f2)"
+          if [[ "$build_type_base" != "$build_type_head" ]]; then
+            echo "Build type mismatch: '$build_type_head' → '$build_type_base'"; exit 1
+          fi
+
+          # Ensure the remote-tracking base exists locally
+          git fetch --no-tags origin "refs/heads/${base}:refs/remotes/origin/${base}"
+
+          merge_base="$(git merge-base HEAD "origin/${base}")"
+          CHANGED="$(git diff --name-only "$merge_base" HEAD)"
+
+          echo "$CHANGED" | grep -q "^app/build.gradle" || echo "NOTE: If you use Kotlin DSL, ensure app/build.gradle.kts is updated."
+          echo "$CHANGED" | grep -Eq "^app/build.gradle(\.kts)?$" || { echo "Missing version bump in app/build.gradle(.kts)"; exit 1; }
+          echo "$CHANGED" | grep -q "^CHANGELOG.md$" || { echo "Missing CHANGELOG.md update"; exit 1; }
+
+  prod_pr_tag_hint:
+    name: Prod PR → expected GA tag
+    if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'prod/') && endsWith(github.base_ref, '-latest') }}
+    runs-on: ubuntu-latest
+    needs: [require_version_and_changelog]  # <-- ensures versionName already validated
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+          fetch-depth: 0
+
+      - name: Compute expected GA tag & explain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="${{ github.base_ref }}"   # prod/o2-latest
+          if [[ "$base" =~ ^prod/([^/]+)-latest$ ]]; then
+            slug="${BASH_REMATCH[1]}"
+          else
+            slug="${{ github.event.repository.name }}"
+          fi
+
+          vn_gradle=""
+          if [[ -f app/build.gradle ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*$/\1/p' app/build.gradle | tail -n1)"
+          fi
+          if [[ -z "$vn_gradle" && -f app/build.gradle.kts ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | tail -n1)"
+          fi
+          test -n "$vn_gradle" || { echo "::error ::Could not read versionName from app/build.gradle(.kts)"; exit 1; }
+
+          tag="${slug}-${vn_gradle}"
+
+          {
+            echo "### ℹ️ GA tag info"
+            echo "- **Expected GA tag after merge:** \`${tag}\`"
+            echo "- Once this PR is merged into \`${base}\`, tag the merge commit:"
+            echo "  \`git tag ${tag} && git push origin ${tag}\`"
+            echo "- That tag will run **Tags (RC/GA): Build, Sign & Upload to S3** and produce the GA APK."
+          } >> "$GITHUB_STEP_SUMMARY"
+  
+  unit_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set per-run Gradle home
+        shell: bash
+        run: |
+          echo "GRADLE_USER_HOME=$RUNNER_TEMP/gradle-home" >> "$GITHUB_ENV"
+
+      # Build the PR merge ref when event is PR; otherwise default checkout
+      - uses: actions/checkout@v4
+        if: ${{ github.event_name == 'pull_request' }}
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        if: ${{ github.event_name != 'pull_request' }}
+
+      - name: "Sanity: what are we building?"
+        run: |
+          echo "event: ${{ github.event_name }}"
+          echo "base_ref: ${{ github.base_ref }}"
+          echo "head_ref: ${{ github.head_ref }}"
+          echo "sha: ${{ github.sha }}"
+          git --no-pager log -1 --decorate=short --oneline
+          git grep -nP '\b_\b' -- app/src || true
+
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x gradlew
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Assert Java 17
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version 2>&1 | tee /tmp/java-version.txt
+          if ! grep -qE 'version "17\.' /tmp/java-version.txt; then
+            echo "Not on JDK 17"; exit 1
+          fi
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          dependency-graph: disabled
+          validate-wrappers: false
+          cache-read-only: false
+
+      - uses: android-actions/setup-android@v3
+      - run: yes | sdkmanager --licenses
+      - run: sdkmanager "cmdline-tools;latest" "platform-tools" "platforms;android-33" "build-tools;33.0.2" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Tooling diag
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          ./gradlew --version
+
+      - name: Run unit tests
+        run: ./gradlew clean test --stacktrace --info --warning-mode all --no-daemon
+
+  pr_release_debug_apk:
+    name: PR → release/* Debug APK
+    # Skip on forked PRs (secrets don't flow)
+    if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && github.event.pull_request.head.repo.fork == false }}
+    needs: [branch_naming, pr_title_contains_jira, pr_base_policy, require_version_and_changelog, unit_tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      APK_S3_BUCKET: ${{ secrets.APK_S3_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+          fetch-depth: 0
+
+      - name: "Sanity: what are we building?"
+        run: |
+          git --no-pager log -1 --decorate=short --oneline
+          git grep -nP '\b_\b' -- app/src || true
+
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x gradlew
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager "cmdline-tools;latest" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Assert checked-in google-services.json exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/google-services.json || {
+            echo "::error ::app/google-services.json not found in repo"
+            exit 1
+          }
+
+      - name: Recreate keystore from secret (debug too)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_KEYSTORE_BASE64:-}" || { echo "::error ::Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/daisy.jks" || { echo "::error ::Keystore base64 decode failed"; exit 1; }
+
+      - name: Assemble debug (signed with MPC keystore)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
+          APP_AWS_ACCESS_KEY_ID: ${{ secrets.APP_AWS_ACCESS_KEY_ID }}
+          APP_AWS_SECRET_ACCESS_KEY: ${{ secrets.APP_AWS_SECRET_ACCESS_KEY }}
+          DATADOG_APPLICATION_ID: ${{ secrets.DATA_DOG_APPLICATION_ID }}
+          DATADOG_CLIENT_TOKEN: ${{ secrets.DATA_DOG_CLIENT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew clean :app:assembleDebug \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/daisy.jks" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_ALIAS_PASSWORD" \
+            -PAPP_AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID" \
+            -PAPP_AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY" \
+            -PDATADOG_APPLICATION_ID="$DATADOG_APPLICATION_ID" \
+            -PDATADOG_CLIENT_TOKEN="$DATADOG_CLIENT_TOKEN"
+
+      - name: Locate debug APK (short name + version + size)
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk -type f -path '*/debug/*.apk' -print -quit || true)"
+          test -n "$APK" || { echo "No debug APK found"; exit 1; }
+
+          base="${{ github.base_ref }}"   # release/<slug>/<version>
+          if [[ "$base" =~ ^release/([^/]+)/ ]]; then slug="${BASH_REMATCH[1]}"; else slug="${{ github.event.repository.name }}"; fi
+          ref="${{ github.head_ref || github.ref_name }}"
+          ticket="$(echo "$ref" | grep -oE 'DAIS-[0-9]+' | head -n1 || echo NA)"
+          sha7="${GITHUB_SHA::7}"
+
+          NAME="${slug}-${ticket}-${sha7}-debug.apk"
+          DEST="$RUNNER_TEMP/$NAME"
+          cp "$APK" "$DEST"
+
+          BYTES="$(stat -c%s "$DEST" 2>/dev/null || stat -f%z "$DEST")"
+          if command -v numfmt >/dev/null 2>&1; then
+            SIZE="$(numfmt --to=iec --suffix=B "$BYTES")"
+          else
+            SIZE="$(du -h "$DEST" | cut -f1)"
+          fi
+
+          APKANA="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          [[ -x "$APKANA" ]] || APKANA="$(command -v apkanalyzer || true)"
+          if [[ -n "$APKANA" ]]; then
+            VN="$("$APKANA" manifest print "$DEST" | grep -oE 'versionName=\"?[^\"]+' | sed -E 's/.*versionName=\"?//')"
+          fi
+          VN="${VN:-unknown}"
+
+          {
+            echo "apk=$DEST"
+            echo "slug=$slug"
+            echo "ticket=$ticket"
+            echo "sha7=$sha7"
+            echo "name=$NAME"
+            echo "size=$SIZE"
+            echo "version=$VN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assert Firebase resources packaged (aapt → fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="${{ steps.out.outputs.apk }}"
+          AAPT="$(ls -1d "${ANDROID_SDK_ROOT}/build-tools/"* 2>/dev/null | sort -V | tail -n1)/aapt"
+          if [[ -x "$AAPT" ]]; then
+            if "$AAPT" dump resources "$APK" | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (aapt)."
+              exit 0
+            else
+              echo "aapt couldn't find google_app_id; trying fallback…"
+            fi
+          fi
+          if unzip -p "$APK" resources.arsc >/dev/null 2>&1; then
+            if unzip -p "$APK" resources.arsc | strings | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (fallback scan)."
+              exit 0
+            fi
+          fi
+          echo "::error ::google_app_id not found in APK resources."
+          echo "- Ensure the Google Services Gradle plugin is applied at the **bottom** of app/build.gradle:"
+          echo "    apply plugin: 'com.google.gms.google-services'"
+          echo "- Ensure app/google-services.json is present **before** Gradle configuration."
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-${{ steps.out.outputs.slug }}-${{ steps.out.outputs.ticket }}-${{ steps.out.outputs.sha7 }}
+          path: ${{ steps.out.outputs.apk }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Assert APK versionName == Gradle versionName
+        shell: bash
+        run: |
+          set -euo pipefail
+          VN_APK="${{ steps.out.outputs.version }}"
+          vn_gradle=""
+          if [[ -f app/build.gradle ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*$/\1/p' app/build.gradle | tail -n1)"
+          fi
+          if [[ -z "$vn_gradle" && -f app/build.gradle.kts ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | tail -n1)"
+          fi
+          test -n "$vn_gradle" || { echo "::error ::Could not read versionName from app/build.gradle(.kts)"; exit 1; }
+          test -n "$VN_APK"    || { echo "::error ::APK versionName is empty/unknown"; exit 1; }
+          if [[ "$VN_APK" != "$vn_gradle" ]]; then
+            echo "::error title=Version mismatch::APK manifest versionName='$VN_APK' but Gradle declares '$vn_gradle'"
+            {
+              echo "### ❌ Version mismatch"
+              echo "- APK \`versionName\`: \`$VN_APK\`"
+              echo "- Gradle \`versionName\`: \`$vn_gradle\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "### ✅ Version check (debug)"
+            echo "- \`versionName\`: \`$VN_APK\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Derive S3 keys (PR → release/*)
+        id: key
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr="${{ github.event.number }}"
+          base="${{ github.base_ref }}"   # release/<slug>/<version>
+          sha7="${GITHUB_SHA::7}"
+          if [[ "$base" =~ ^release/([^/]+)/ ]]; then slug="${BASH_REMATCH[1]}"; else slug="unknown"; fi
+          test "$slug" != "unknown" || { echo "Failed to parse slug from base: $base"; exit 1; }
+          PREFIX="android/${slug}/pr/${pr}/${sha7}"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "${{ steps.out.outputs.apk }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS (internal PRs only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Upload APK to S3 (internal PRs only)
+        id: s3
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${APK_S3_BUCKET:-}" ]]; then
+            echo "S3 bucket not configured; skipping upload."
+            exit 0
+          fi
+          KEY="${{ steps.key.outputs.prefix }}/apk/${{ steps.key.outputs.name }}"
+          DEST="s3://${APK_S3_BUCKET}/${KEY}"
+          aws s3 cp "${{ steps.out.outputs.apk }}" "$DEST" \
+            --only-show-errors \
+            --content-type application/vnd.android.package-archive
+          URL="$(aws s3 presign "$DEST" --expires-in 604800)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post/update APK link comment
+        uses: actions/github-script@v7
+        env:
+          S3_URL:      ${{ steps.s3.outputs.url }}
+          APK_NAME:    ${{ steps.out.outputs.name }}
+          APK_SIZE:    ${{ steps.out.outputs.size }}
+          APK_VERSION: ${{ steps.out.outputs.version }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            const marker = '<!-- apk-bot-debug -->';
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const s3Url = process.env.S3_URL || '';
+            const vn = process.env.APK_VERSION && process.env.APK_VERSION !== 'unknown' ? `v${process.env.APK_VERSION}` : null;
+            const parts = [vn, process.env.APK_SIZE].filter(Boolean).join(' • ');
+            const label = parts ? `${process.env.APK_NAME} (${parts})` : (process.env.APK_NAME || 'APK');
+
+            const s3Line = s3Url
+              ? `- Direct S3 download: [${label}](${s3Url})`
+              : '- Direct S3 download: _skipped (fork PR or bucket not configured)_.';
+
+            const body = `
+              ${marker}
+              ✅ **Debug APK (PR → release)**
+              - Workflow artifacts: ${runUrl}
+              ${s3Line}
+              `;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            }
+            await core.summary
+              .addHeading('APK (PR → release)')
+              .addLink('Workflow artifacts', runUrl)
+              .addRaw(s3Url ? `<br/>S3: <a href="${s3Url}">${label}</a>` : '<br/>S3: skipped')
+              .write()
+
+  pr_prod_release_apk:
+    name: PR → prod/*-latest Release APK (SIGNED)
+    # Skip on forked PRs (secrets don't flow)
+    if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'prod/') && endsWith(github.base_ref, '-latest') && github.event.pull_request.head.repo.fork == false }}
+    needs: [branch_naming, pr_title_contains_jira, pr_base_policy, require_version_and_changelog, unit_tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      APK_S3_BUCKET: ${{ secrets.APK_S3_BUCKET }}
+  
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.number }}/merge
+          fetch-depth: 0
+  
+      - name: "Sanity: what are we building?"
+        run: |
+          git --no-pager log -1 --decorate=short --oneline
+          echo "event: ${{ github.event_name }}"
+          echo "base_ref: ${{ github.base_ref }}"
+          echo "head_ref: ${{ github.head_ref }}"
+          echo "sha: ${{ github.sha }}"
+  
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x gradlew
+  
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+  
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          dependency-graph: disabled
+          validate-wrappers: false
+          cache-read-only: false
+  
+      - uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses
+      - name: Install Android SDK components
+        run: |
+          sdkmanager "cmdline-tools;latest" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+  
+      - name: Assert checked-in google-services.json exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/google-services.json || {
+            echo "::error ::app/google-services.json not found in repo"
+            exit 1
+          }
+  
+      # Recreate keystore so we can sign the productionRelease APK
+      - name: Recreate keystore from secret
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_KEYSTORE_BASE64:-}" || { echo "::error ::Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/daisy.jks" || { echo "::error ::Keystore base64 decode failed"; exit 1; }
+  
+      # Build a **signed** productionRelease (no debug fallback)
+      - name: Assemble production release (signed)
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          APP_AWS_ACCESS_KEY_ID: ${{ secrets.APP_AWS_ACCESS_KEY_ID }}
+          APP_AWS_SECRET_ACCESS_KEY: ${{ secrets.APP_AWS_SECRET_ACCESS_KEY }}
+          DATADOG_APPLICATION_ID: ${{ secrets.DATA_DOG_APPLICATION_ID }}
+          DATADOG_CLIENT_TOKEN: ${{ secrets.DATA_DOG_CLIENT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:clean :app:assembleProductionRelease \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_ALIAS_PASSWORD" \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/daisy.jks" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -PAPP_AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID" \
+            -PAPP_AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY" \
+            -PDATADOG_APPLICATION_ID="$DATADOG_APPLICATION_ID" \
+            -PDATADOG_CLIENT_TOKEN="$DATADOG_CLIENT_TOKEN"
+  
+      - name: Locate release APK (short name + version + size)
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer canonical flavor path; then fall back
+          APK="$(find app/build/outputs/apk/production/release -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+          if [[ -z "$APK" ]]; then
+            APK="$(find app/build/outputs/apk -type f -path '*/release/*.apk' -name '*.apk' -print -quit 2>/dev/null || true)"
+          fi
+          test -n "$APK" || { echo "No release APK found"; ls -R app/build/outputs || true; exit 1; }
+  
+          base="${{ github.base_ref }}"   # prod/<slug>-latest
+          if [[ "$base" =~ ^prod/([^/]+)-latest$ ]]; then slug="${BASH_REMATCH[1]}"; else slug="${{ github.event.repository.name }}"; fi
+  
+          sha7="${GITHUB_SHA::7}"
+          NAME="${slug}-${sha7}-productionRelease.apk"
+          DEST="$RUNNER_TEMP/$NAME"
+          cp "$APK" "$DEST"
+  
+          BYTES="$(stat -c%s "$DEST" 2>/dev/null || stat -f%z "$DEST")"
+          if command -v numfmt >/dev/null 2>&1; then
+            SIZE="$(numfmt --to=iec --suffix=B "$BYTES")"
+          else
+            SIZE="$(du -h "$DEST" | cut -f1)"
+          fi
+  
+          APKANA="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          [[ -x "$APKANA" ]] || APKANA="$(command -v apkanalyzer || true)"
+          VN="unknown"
+          if [[ -n "$APKANA" ]]; then
+            if "$APKANA" manifest print "$DEST" >/tmp/manifest.txt 2>/dev/null; then
+              VN="$(grep -oE 'versionName=\"?[^\"]+' /tmp/manifest.txt | sed -E 's/.*versionName=\"?//')"
+              VN="${VN:-unknown}"
+            fi
+          fi
+  
+          {
+            echo "apk=$DEST"
+            echo "slug=$slug"
+            echo "sha7=$sha7"
+            echo "name=$NAME"
+            echo "size=$SIZE"
+            echo "version=$VN"
+          } >> "$GITHUB_OUTPUT"
+  
+      - name: Verify APK signature (v1/v2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="${{ steps.out.outputs.apk }}"
+          APKSIGNER="$(ls -1d "${ANDROID_SDK_ROOT}/build-tools/"* 2>/dev/null | sort -V | tail -n1)/apksigner"
+          [[ -x "$APKSIGNER" ]] || { echo "::error ::apksigner not found"; exit 1; }
+          "$APKSIGNER" verify --print-certs "$APK"
+  
+      - name: Assert Firebase resources packaged (aapt → fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="${{ steps.out.outputs.apk }}"
+          AAPT="$(ls -1d "${ANDROID_SDK_ROOT}/build-tools/"* 2>/dev/null | sort -V | tail -n1)/aapt"
+          if [[ -x "$AAPT" ]]; then
+            if "$AAPT" dump resources "$APK" | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (aapt)."
+              exit 0
+            else
+              echo "aapt couldn't find google_app_id; trying fallback…"
+            fi
+          fi
+          if unzip -p "$APK" resources.arsc >/dev/null 2>&1; then
+            if unzip -p "$APK" resources.arsc | strings | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (fallback scan)."
+              exit 0
+            fi
+          fi
+          echo "::error ::google_app_id not found in APK resources."
+          echo "- Ensure the Google Services Gradle plugin is applied at the **bottom** of app/build.gradle:"
+          echo "    apply plugin: 'com.google.gms.google-services'"
+          echo "- Ensure app/google-services.json is present **before** Gradle configuration."
+          exit 1
+  
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-${{ steps.out.outputs.slug }}-${{ steps.out.outputs.sha7 }}
+          path: ${{ steps.out.outputs.apk }}
+          retention-days: 14
+          if-no-files-found: error
+  
+      - name: Assert APK versionName == Gradle versionName
+        shell: bash
+        run: |
+          set -euo pipefail
+          VN_APK="${{ steps.out.outputs.version }}"
+          vn_gradle=""
+          if [[ -f app/build.gradle ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*$/\1/p' app/build.gradle | tail -n1)"
+          fi
+          if [[ -z "$vn_gradle" && -f app/build.gradle.kts ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | tail -n1)"
+          fi
+          test -n "$vn_gradle" || { echo "::error ::Could not read versionName from app/build.gradle(.kts)"; exit 1; }
+          test -n "$VN_APK"    || { echo "::error ::APK versionName is empty/unknown"; exit 1; }
+          if [[ "$VN_APK" != "$vn_gradle" ]]; then
+            echo "::error title=Version mismatch::APK manifest versionName='$VN_APK' but Gradle declares '$vn_gradle'"
+            exit 1
+          fi
+          echo "OK: versionName '$VN_APK'"
+  
+      - name: Derive S3 keys (PR → prod/*-latest)
+        id: key
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr="${{ github.event.number }}"
+          base="${{ github.base_ref }}"   # prod/<slug>-latest
+          sha7="${GITHUB_SHA::7}"
+          if [[ "$base" =~ ^prod/([^/]+)-latest$ ]]; then slug="${BASH_REMATCH[1]}"; else slug="unknown"; fi
+          PREFIX="android/${slug}/prod-pr/${pr}/${sha7}"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "${{ steps.out.outputs.apk }}")" >> "$GITHUB_OUTPUT"
+  
+      - name: Configure AWS (internal PRs only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+  
+      - name: Upload APK to S3 (internal PRs only)
+        id: s3
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${APK_S3_BUCKET:-}" ]]; then
+            echo "S3 bucket not configured; skipping upload."
+            exit 0
+          fi
+          KEY="${{ steps.key.outputs.prefix }}/apk/${{ steps.key.outputs.name }}"
+          DEST="s3://${APK_S3_BUCKET}/${KEY}"
+          aws s3 cp "${{ steps.out.outputs.apk }}" "$DEST" \
+            --only-show-errors \
+            --content-type application/vnd.android.package-archive
+          URL="$(aws s3 presign "$DEST" --expires-in 604800)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+  
+      - name: Post/update APK link comment
+        uses: actions/github-script@v7
+        env:
+          S3_URL:      ${{ steps.s3.outputs.url }}
+          APK_NAME:    ${{ steps.out.outputs.name }}
+          APK_SIZE:    ${{ steps.out.outputs.size }}
+          APK_VERSION: ${{ steps.out.outputs.version }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            const marker = '<!-- apk-bot-prod -->';
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+  
+            const s3Url = process.env.S3_URL || '';
+            const vn = process.env.APK_VERSION && process.env.APK_VERSION !== 'unknown' ? `v${process.env.APK_VERSION}` : null;
+            const parts = [vn, process.env.APK_SIZE].filter(Boolean).join(' • ');
+            const label = parts ? `${process.env.APK_NAME} (${parts})` : (process.env.APK_NAME || 'APK');
+  
+            const s3Line = s3Url
+              ? `- Direct S3 download: [${label}](${s3Url})`
+              : '- Direct S3 download: _skipped (fork PR or bucket not configured)_.';
+  
+            const body = `
+              ${marker}
+              ✅ **Release APK (PR → prod)**
+              - Workflow artifacts: ${runUrl}
+              ${s3Line}
+              `;
+  
+            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            }
+            await core.summary
+              .addHeading('APK (PR → prod)')
+              .addLink('Workflow artifacts', runUrl)
+              .addRaw(s3Url ? `<br/>S3: <a href="${s3Url}">${label}</a>` : '<br/>S3: skipped')
+              .write()
+
+
+  tag_policy:
+    name: Enforce tag naming
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag name pattern
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          # Accept: <slug>-<major>.<minor>(.<patch>)? with optional -rcN|-rN|-hfN
+          if [[ ! "$ref" =~ ^[a-zA-Z0-9._+-]+-[0-9]+\.[0-9]+(\.[0-9]+)?(-(rc|r|hf)[0-9]+)?$ ]]; then
+            echo "Invalid tag '$ref'. Use <slug>-<major>.<minor>(.<patch>)?[-rcN|-rN|-hfN]"
+            exit 1
+          fi
+
+  tag_rc_ga_build_upload:
+    name: "Tags (RC/GA): Build, Sign & Upload to S3"
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+    needs: [tag_policy, unit_tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    env:
+      APK_S3_BUCKET: ${{ secrets.APK_S3_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag version matches Gradle versionName (pre-build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+
+          # Extract version from tag (supports GA and rc/r/hf forms)
+          if [[ "$ref" =~ ^([a-zA-Z0-9._+-]+)-([0-9]+\.[0-9]+(\.[0-9]+)?)($|-(rc|r|hf)[0-9]+$) ]]; then
+            TAG_VERSION="${BASH_REMATCH[2]}"
+          else
+            echo "::error ::Tag '${ref}' doesn't contain a semantic version segment"
+            exit 1
+          fi
+
+          vn_gradle=""
+          if [[ -f app/build.gradle ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*$/\1/p' app/build.gradle | tail -n1)"
+          fi
+          if [[ -z "$vn_gradle" && -f app/build.gradle.kts ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | tail -n1)"
+          fi
+          test -n "$vn_gradle" || { echo "::error ::Could not read versionName from app/build.gradle(.kts)"; exit 1; }
+
+          if [[ "$TAG_VERSION" != "$vn_gradle" ]]; then
+            echo "::error title=Tag/Gradle version mismatch::tag='$TAG_VERSION' vs Gradle versionName='$vn_gradle'"
+            exit 1
+          fi
+          echo "OK: tag '$ref' version '$TAG_VERSION' matches Gradle versionName '$vn_gradle'"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses
+      
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2" "cmdline-tools;latest"
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Recreate keystore from secret (debug too)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_KEYSTORE_BASE64:-}" || { echo "::error ::Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/daisy.jks" || { echo "::error ::Keystore base64 decode failed"; exit 1; }
+
+      - name: Assert checked-in google-services.json exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/google-services.json || {
+            echo "::error ::app/google-services.json not found in repo"
+            exit 1
+          }
+
+      - name: Build production release (signed)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
+          APP_AWS_ACCESS_KEY_ID: ${{ secrets.APP_AWS_ACCESS_KEY_ID }}
+          APP_AWS_SECRET_ACCESS_KEY: ${{ secrets.APP_AWS_SECRET_ACCESS_KEY }}
+          DATADOG_APPLICATION_ID: ${{ secrets.DATA_DOG_APPLICATION_ID }}
+          DATADOG_CLIENT_TOKEN: ${{ secrets.DATA_DOG_CLIENT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:clean :app:assembleProductionRelease \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_ALIAS_PASSWORD" \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/daisy.jks" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -PAPP_AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID" \
+            -PAPP_AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY" \
+            -PDATADOG_APPLICATION_ID="$DATADOG_APPLICATION_ID" \
+            -PDATADOG_CLIENT_TOKEN="$DATADOG_CLIENT_TOKEN"
+
+      - name: Locate outputs (APK & mapping)
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer the canonical productionRelease path, then fall back to any release APK
+          APK="$(find app/build/outputs/apk/production/release -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+          if [[ -z "$APK" ]]; then
+            APK="$(find app/build/outputs/apk -type f -path '*/release/*.apk' -name '*.apk' -print -quit 2>/dev/null || true)"
+          fi
+          test -n "$APK" || { echo "APK not found"; ls -R app/build/outputs || true; exit 1; }
+
+          # Mapping file (if minified)
+          MAP="$(find app/build/outputs/mapping -type f -path '*/productionRelease/mapping.txt' -print -quit 2>/dev/null || true)"
+
+          # Extract versionName via apkanalyzer if available
+          APKANA="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          [[ -x "$APKANA" ]] || APKANA="$(command -v apkanalyzer || true)"
+          VN="unknown"
+          if [[ -n "$APKANA" ]]; then
+            if "$APKANA" manifest print "$APK" >/tmp/manifest.txt 2>/dev/null; then
+              VN="$(grep -oE 'versionName=\"?[^\"]+' /tmp/manifest.txt | sed -E 's/.*versionName=\"?//')"
+              VN="${VN:-unknown}"
+            fi
+          fi
+
+          {
+            echo "apk=$APK"
+            echo "mapping=$MAP"
+            echo "version=$VN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assert Firebase resources packaged (aapt → fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="${{ steps.out.outputs.apk }}"
+          AAPT="$(ls -1d "${ANDROID_SDK_ROOT}/build-tools/"* 2>/dev/null | sort -V | tail -n1)/aapt"
+          if [[ -x "$AAPT" ]]; then
+            if "$AAPT" dump resources "$APK" | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (aapt)."
+              exit 0
+            else
+              echo "aapt couldn't find google_app_id; trying fallback…"
+            fi
+          fi
+          if unzip -p "$APK" resources.arsc >/dev/null 2>&1; then
+            if unzip -p "$APK" resources.arsc | strings | grep -q 'google_app_id'; then
+              echo "✅ google_app_id found (fallback scan)."
+              exit 0
+            fi
+          fi
+          echo "::error ::google_app_id not found in APK resources."
+          echo "- Ensure the Google Services Gradle plugin is applied at the **bottom** of app/build.gradle:"
+          echo "    apply plugin: 'com.google.gms.google-services'"
+          echo "- Ensure app/google-services.json is present **before** Gradle configuration."
+          exit 1
+
+      - name: Assert APK versionName == Gradle versionName
+        shell: bash
+        run: |
+          set -euo pipefail
+          VN_APK="${{ steps.out.outputs.version }}"
+          vn_gradle=""
+          if [[ -f app/build.gradle ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*$/\1/p' app/build.gradle | tail -n1)"
+          fi
+          if [[ -z "$vn_gradle" && -f app/build.gradle.kts ]]; then
+            vn_gradle="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | tail -n1)"
+          fi
+
+          test -n "$vn_gradle" || { echo "::error ::Could not read versionName from app/build.gradle(.kts)"; exit 1; }
+          test -n "$VN_APK"    || { echo "::error ::APK versionName is empty/unknown"; exit 1; }
+
+          if [[ "$VN_APK" != "$vn_gradle" ]]; then
+            echo "::error title=Version mismatch::APK manifest versionName='$VN_APK' but Gradle declares '$vn_gradle'"
+            {
+              echo "### ❌ Version mismatch (tag build)"
+              echo "- APK \`versionName\`: \`$VN_APK\`"
+              echo "- Gradle \`versionName\`: \`$vn_gradle\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "### ✅ Version check (tag)"
+            echo "- \`versionName\`: \`$VN_APK\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Derive S3 keys from tag
+        id: key
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          sha7="${GITHUB_SHA::7}"
+
+          channel="prod"    # default; RC goes to "release"
+          class="ga"
+          slug=""
+          version=""
+
+          # GA: <slug>-<MAJOR.MINOR(.PATCH)>
+          if [[ "$ref" =~ ^([a-zA-Z0-9._+-]+)-([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            slug="${BASH_REMATCH[1]}"
+            version="${BASH_REMATCH[2]}"
+
+          # RC/Rebuild/Hotfix: <slug>-<ver>-(rc|r|hf)N
+          elif [[ "$ref" =~ ^([a-zA-Z0-9._+-]+)-([0-9]+\.[0-9]+(\.[0-9]+)?)-(rc|r|hf)([0-9]+)$ ]]; then
+            slug="${BASH_REMATCH[1]}"
+            version="${BASH_REMATCH[2]}"
+            kind="${BASH_REMATCH[4]}"
+            n="${BASH_REMATCH[5]}"
+
+            case "$kind" in
+              rc) class="rc${n}"; channel="release" ;;
+              r)  class="r${n}";  channel="prod"    ;;
+              hf) class="hf${n}"; channel="prod"    ;;
+            esac
+          else
+            echo "Tag '${ref}' does not match expected patterns"; exit 1
+          fi
+
+          if [[ -z "$slug" || -z "$version" ]]; then
+            echo "Failed to parse slug/version from ref '${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}'"
+            exit 1
+          fi
+
+          if [[ "$channel" == "release" ]]; then
+            base="android/${slug}/release/${version}/${class}/${sha7}"
+          else
+            base="android/${slug}/prod/${version}/${class}/${sha7}"
+          fi
+
+          name_apk="${slug}-v${version}-${class}-productionRelease-${sha7}.apk"
+
+          echo "slug=$slug"         >> "$GITHUB_OUTPUT"
+          echo "version=$version"   >> "$GITHUB_OUTPUT"
+          echo "class=$class"       >> "$GITHUB_OUTPUT"
+          echo "channel=$channel"   >> "$GITHUB_OUTPUT"
+          echo "base=$base"         >> "$GITHUB_OUTPUT"
+          echo "name_apk=$name_apk" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Build checksums & meta
+        id: files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/checksums out/meta out/mapping
+          cp "${{ steps.out.outputs.apk }}" "out/${{ steps.key.outputs.name_apk }}"
+          sha256sum "out/${{ steps.key.outputs.name_apk }}" > out/checksums/SHA256SUMS
+          cat > out/meta/build.json <<EOF
+          {
+            "slug":        "${{ steps.key.outputs.slug }}",
+            "version":     "${{ steps.key.outputs.version }}",
+            "releaseClass":"${{ steps.key.outputs.class }}",
+            "channel":     "${{ steps.key.outputs.channel }}",
+            "gitSha":      "${GITHUB_SHA}",
+            "gitRef":      "${GITHUB_REF}",
+            "artifact":    "${{ steps.key.outputs.name_apk }}",
+            "builtAt":     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          }
+          EOF
+          if [[ -f "${{ steps.out.outputs.mapping }}" ]]; then
+            cp "${{ steps.out.outputs.mapping }}" out/mapping/mapping.txt
+          fi
+
+      - name: Upload to S3
+        id: s3
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${APK_S3_BUCKET:-}" || { echo "Missing APK_S3_BUCKET secret"; exit 1; }
+          ROOT="s3://${APK_S3_BUCKET}/${{ steps.key.outputs.base }}"
+          OBJ="$ROOT/apk/${{ steps.key.outputs.name_apk }}"
+          aws s3 cp "out/${{ steps.key.outputs.name_apk }}" "$OBJ" \
+            --only-show-errors \
+            --content-type application/vnd.android.package-archive
+          aws s3 cp out/checksums/SHA256SUMS  "$ROOT/checksums/SHA256SUMS" --only-show-errors
+          aws s3 cp out/meta/build.json       "$ROOT/meta/build.json"       --only-show-errors
+          if [[ -f out/mapping/mapping.txt ]]; then
+            aws s3 cp out/mapping/mapping.txt "$ROOT/mapping/mapping.txt" --only-show-errors
+          fi
+          URL="$(aws s3 presign "$OBJ" --expires-in 604800)"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Publish GA APK link as GitHub Release
+        uses: actions/github-script@v7
+        env:
+          APK_URL:  ${{ steps.s3.outputs.url }}
+          SLUG:     ${{ steps.key.outputs.slug }}
+          VERSION:  ${{ steps.key.outputs.version }}
+          CLASS:    ${{ steps.key.outputs.class }}
+          CHANNEL:  ${{ steps.key.outputs.channel }}
+          BASE:     ${{ steps.key.outputs.base }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.GITHUB_REF_NAME;
+
+            const name = `${process.env.SLUG} ${process.env.VERSION} (${process.env.CLASS})`;
+            const bodyLines = [
+              `**Channel:** \`${process.env.CHANNEL}\``,
+              `**Artifact:** \`${process.env.SLUG}-v${process.env.VERSION}-${process.env.CLASS}-productionRelease\``,
+              '',
+              process.env.APK_URL
+                ? `**Download (presigned, ~7 days):** ${process.env.APK_URL}`
+                : '**Download:** _URL not available (S3 upload failed or not configured)._',
+              '',
+              `**S3 base path:** \`${process.env.BASE}\``,
+              '',
+              '_Presigned URL expires; the permanent artifact lives at the S3 path above._'
+            ];
+            const body = bodyLines.join('\n');
+
+            const prerelease = process.env.CLASS.startsWith('rc');
+
+            const releases = await github.rest.repos.listReleases({ owner, repo });
+            const existing = releases.data.find(r => r.tag_name === tag);
+
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: existing.id,
+                name,
+                body,
+                prerelease
+              });
+            } else {
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name,
+                body,
+                draft: false,
+                prerelease
+              });
+            }
+      
+      - name: Post GA S3 link back to release → prod PR
+        if: ${{ steps.key.outputs.class == 'ga' }}
+        uses: actions/github-script@v7
+        env:
+          APK_URL:  ${{ steps.s3.outputs.url }}
+          SLUG:     ${{ steps.key.outputs.slug }}
+          VERSION:  ${{ steps.key.outputs.version }}
+          CLASS:    ${{ steps.key.outputs.class }}
+          CHANNEL:  ${{ steps.key.outputs.channel }}
+          BASE:     ${{ steps.key.outputs.base }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const apkUrl    = process.env.APK_URL || '';
+            const slug      = process.env.SLUG;
+            const version   = process.env.VERSION;
+            const releaseClass = process.env.CLASS;
+            const channel   = process.env.CHANNEL;
+            const basePath  = process.env.BASE;
+
+            if (!apkUrl) {
+              core.info('No APK_URL from tag build; skipping PR comment.');
+              return;
+            }
+            if (!slug) {
+              core.info('No SLUG in env; skipping PR comment.');
+              return;
+            }
+
+            const baseBranch = `prod/${slug}-latest`;
+            core.info(`Looking for latest closed PR into ${baseBranch}…`);
+
+            // Fetch most recent closed PRs into prod/<slug>-latest
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'closed',
+              base: baseBranch,
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 50,
+            });
+
+            if (!prs.length) {
+              core.info(`No closed PRs found with base=${baseBranch}; skipping PR comment.`);
+              return;
+            }
+
+            // Heuristic: first closed PR is the most recent release → prod/*-latest
+            const candidate = prs[0];
+            const issue_number = candidate.number;
+            core.info(`Posting GA link comment on PR #${issue_number} (title: "${candidate.title}")`);
+
+            const marker = '<!-- apk-ga-prod -->';
+            const parts = [
+              `\`${slug}-v${version}-${releaseClass}-productionRelease\``,
+              `channel: \`${channel}\``
+            ];
+
+            const bodyLines = [
+              marker,
+              `✅ **GA build published for \`${slug}\` v${version}**`,
+              `- **Download (presigned, ~7 days):** ${apkUrl}`,
+              `- **Artifact:** ${parts.join(' • ')}`,
+              `- **S3 base path:** \`${basePath}\``,
+              '',
+              '_Presigned URL expires; permanent location is the S3 base path above._'
+            ];
+            const body = bodyLines.join('\n');
+
+            // Upsert comment keyed by marker
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number }
+            );
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing GA comment (id=${existing.id}) on PR #${issue_number}.`);
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+              core.info(`Created new GA comment on PR #${issue_number}.`);
+            }
+      
+      - name: Also publish *-latest APK (stable S3 key)
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${APK_S3_BUCKET:-}" || { echo "Missing APK_S3_BUCKET secret"; exit 1; }
+
+          slug="${{ steps.key.outputs.slug }}"
+          channel="${{ steps.key.outputs.channel }}"   # prod | release
+          base_latest="android/${slug}/${channel}/latest"
+          latest_name="${slug}-latest.apk"
+
+          LATEST_OBJ="s3://${APK_S3_BUCKET}/${base_latest}/apk/${latest_name}"
+
+          # Re-upload same APK bytes to the stable key (overwrites)
+          aws s3 cp "out/${{ steps.key.outputs.name_apk }}" "$LATEST_OBJ" \
+            --only-show-errors \
+            --content-type application/vnd.android.package-archive
+
+          # This is the permanent location (non-presigned)
+          echo "latest_s3_uri=$LATEST_OBJ" >> "$GITHUB_OUTPUT"
+          echo "latest_s3_key=${base_latest}/apk/${latest_name}" >> "$GITHUB_OUTPUT"
+
+          # Optional convenience: still generate a presigned URL for clicking
+          URL="$(aws s3 presign "$LATEST_OBJ" --expires-in 604800)"
+          echo "latest_url=$URL" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ✅ Published *-latest APK"
+            echo "- **Latest S3 URI (permanent):** \`$LATEST_OBJ\`"
+            echo "- **Latest download (presigned, ~7 days):** $URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Job summary
+        shell: bash
+        run: |
+          {
+            echo "### ✅ Tag build uploaded"
+            echo "- **Tag:** \`${GITHUB_REF_NAME}\`"
+            echo "- **Slug/Version:** \`${{ steps.key.outputs.slug }}\` / \`${{ steps.key.outputs.version }}\`"
+            echo "- **Class/Channel:** \`${{ steps.key.outputs.class }}\` / \`${{ steps.key.outputs.channel }}\`"
+            echo "- **APK:** ${{ steps.s3.outputs.url }}"
+            echo "- **S3 base:** \`${{ steps.key.outputs.base }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.key.outputs.slug }}-${{ steps.key.outputs.version }}-${{ steps.key.outputs.class }}"
+          path: |
+            out/${{ steps.key.outputs.name_apk }}
+            out/checksums/SHA256SUMS
+            out/meta/build.json
+            out/mapping/mapping.txt
+          if-no-files-found: ignore
+          retention-days: 14

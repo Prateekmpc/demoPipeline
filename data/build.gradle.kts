@@ -1,8 +1,36 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("kotlin-parcelize")
     id("com.google.devtools.ksp")
+}
+
+val keystoreProps = Properties()
+var keystoreFile = rootProject.file("keystore.local.properties")
+
+if (!keystoreFile.exists()) {
+    keystoreFile = rootProject.file("keystore.properties")
+}
+
+if (keystoreFile.exists()) {
+    keystoreProps.load(FileInputStream(keystoreFile))
+}
+
+val localProps = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) {
+    localProps.load(FileInputStream(localPropsFile))
+}
+
+fun getSecureProperty(name: String, defaultValue: String = ""): String {
+    return project.findProperty(name)?.toString()
+        ?: keystoreProps.getProperty(name)
+        ?: localProps.getProperty(name)
+        ?: System.getenv(name)
+        ?: defaultValue
 }
 
 android {
@@ -13,15 +41,15 @@ android {
         minSdk = 24
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "DATA_DOG_CLIENT_TOKEN", "\"${getProjectProperty("DATA_DOG_CLIENT_TOKEN")}\"")
-        buildConfigField("String", "DATA_DOG_APPLICATION_ID", "\"${getProjectProperty("DATA_DOG_APPLICATION_ID")}\"")
-        buildConfigField("String", "AWS_ACCESS_KEY", "\"${getProjectProperty("AWS_ACCESS_KEY")}\"")
-        buildConfigField("String", "AWS_SECRET_KEY", "\"${getProjectProperty("AWS_SECRET_KEY")}\"")
+        buildConfigField("String", "DATA_DOG_CLIENT_TOKEN", "\"${getSecureProperty("DATA_DOG_CLIENT_TOKEN")}\"")
+        buildConfigField("String", "DATA_DOG_APPLICATION_ID", "\"${getSecureProperty("DATA_DOG_APPLICATION_ID")}\"")
+        buildConfigField("String", "AWS_ACCESS_KEY", "\"${getSecureProperty("AWS_ACCESS_KEY")}\"")
+        buildConfigField("String", "AWS_SECRET_KEY", "\"${getSecureProperty("AWS_SECRET_KEY")}\"")
     }
 
     buildTypes {
         debug {
-            buildConfigField("String", "ENVIRONMENT", "\"${getProjectProperty("ENVIRONMENT", "DEBUG")}\"")
+            buildConfigField("String", "ENVIRONMENT", "\"${getSecureProperty("ENVIRONMENT", "DEBUG")}\"")
         }
         release {
             isMinifyEnabled = false
@@ -29,7 +57,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            buildConfigField("String", "ENVIRONMENT", "\"${getProjectProperty("ENVIRONMENT", "PROD")}\"")
+            buildConfigField("String", "ENVIRONMENT", "\"${getSecureProperty("ENVIRONMENT", "PROD")}\"")
         }
     }
 
@@ -80,32 +108,32 @@ android {
             create("${cleanCarrierName}Staging") {
                 dimension = "buildEnvironment"
                 resValue("string", "app_name", "$carrier - STG")
-                buildConfigField("String", "SERVER_URL", "\"${getProjectProperty("${carrier.uppercase()}_STAGING_SERVER_URL")}\"")
+                buildConfigField("String", "SERVER_URL", "\"${getSecureProperty("${carrier.uppercase()}_STAGING_SERVER_URL")}\"")
                 buildConfigField("String", "ENVIRONMENT", "\"STAGING\"")
                 buildConfigField("String", "SOCKET_URL", "\"${getServerUrl("STAGING", "SOCKET")}\"")
                 buildConfigField("String", "API_INTERNAL_URL", "\"${getServerUrl("STAGING", "API_INTERNAL")}\"")
 
                 if (project.properties.containsKey("${carrier.uppercase()}_STAGING_STORE_ID}")) {
-                    buildConfigField("String", "STORE_ID", "\"${getProjectProperty("${carrier.uppercase()}_STAGING_STORE_ID")}\"")
+                    buildConfigField("String", "STORE_ID", "\"${getSecureProperty("${carrier.uppercase()}_STAGING_STORE_ID")}\"")
                 }
                 if (project.properties.containsKey("${carrier.uppercase()}_STAGING_STORE_PASSWORD")) {
-                    buildConfigField("String", "STORE_PASSWORD", "\"${getProjectProperty("${carrier.uppercase()}_STAGING_STORE_PASSWORD")}\"")
+                    buildConfigField("String", "STORE_PASSWORD", "\"${getSecureProperty("${carrier.uppercase()}_STAGING_STORE_PASSWORD")}\"")
                 }
             }
 
             create("${cleanCarrierName}Production") {
                 dimension = "buildEnvironment"
                 resValue("string", "app_name", "$carrier - PROD")
-                buildConfigField("String", "SERVER_URL", "\"${getProjectProperty("${carrier.uppercase()}_PROD_SERVER_URL")}\"")
+                buildConfigField("String", "SERVER_URL", "\"${getSecureProperty("${carrier.uppercase()}_PROD_SERVER_URL")}\"")
                 buildConfigField("String", "ENVIRONMENT", "\"PROD\"")
                 buildConfigField("String", "SOCKET_URL", "\"${getServerUrl("PROD", "SOCKET")}\"")
                 buildConfigField("String", "API_INTERNAL_URL", "\"${getServerUrl("PROD", "API_INTERNAL")}\"")
 
                 if (project.properties.containsKey("${carrier.uppercase()}_PROD_STORE_ID")) {
-                    buildConfigField("String", "STORE_ID", "\"${getProjectProperty("${carrier.uppercase()}_PROD_STORE_ID")}\"")
+                    buildConfigField("String", "STORE_ID", "\"${getSecureProperty("${carrier.uppercase()}_PROD_STORE_ID")}\"")
                 }
                 if (project.properties.containsKey("${carrier.uppercase()}_PROD_STORE_PASSWORD")) {
-                    buildConfigField("String", "STORE_PASSWORD", "\"${getProjectProperty("${carrier.uppercase()}_PROD_STORE_PASSWORD")}\"")
+                    buildConfigField("String", "STORE_PASSWORD", "\"${getSecureProperty("${carrier.uppercase()}_PROD_STORE_PASSWORD")}\"")
                 }
             }
         }
@@ -151,17 +179,8 @@ android {
     }
 }
 
-fun getProjectProperty(propertyName: String, defaultValue: String = ""): String {
-    return if (project.properties.containsKey(propertyName)) {
-        project.properties[propertyName].toString()
-    } else {
-        println("WARNING: Property '$propertyName' not found in gradle.properties. Using default value: '$defaultValue'")
-        defaultValue
-    }
-}
-
 fun getServerUrl(environmentType: String, type: String): String {
-    val socketBaseUrl = getProjectProperty("${type}_${environmentType}_URL")
+    val socketBaseUrl = getSecureProperty("${type}_${environmentType}_URL")
     return socketBaseUrl
 }
 
