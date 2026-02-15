@@ -1,39 +1,38 @@
 # Labeler configuration for automatic PR labeling based on changed files
-# Each label maps to file patterns that trigger the label
+# Format required for actions/labeler@v6
 
 'area: app':
-  - app/**
-  - '!app/build/**'
-  - '!app/**/*.iml'
+  - changed-files:
+    - any-glob-to-any-file: 'app/**'
 
 'area: data':
-  - data/**
+  - changed-files:
+    - any-glob-to-any-file: 'data/**'
 
 'area: domain':
-  - domain/**
+  - changed-files:
+    - any-glob-to-any-file: 'domain/**'
 
 'area: ci':
-  - .github/**
-  - '!.github/labeler.yml'
+  - changed-files:
+    - any-glob-to-any-file: '.github/**'
 
 'area: docs':
-  - '*.md'
-  - 'docs/**'
-  - '.github/PULL_REQUEST_TEMPLATE/**'
+  - changed-files:
+    - any-glob-to-any-file: '*.md'
 
 'area: build':
-  - 'build.gradle.kts'
-  - 'settings.gradle.kts'
-  - 'gradle/**'
-  - 'gradlew'
-  - 'gradlew.bat'
-  - 'gradle.properties'
+  - changed-files:
+    - any-glob-to-any-file: 'build.gradle.kts'
+  - changed-files:
+    - any-glob-to-any-file: 'settings.gradle.kts'
+  - changed-files:
+    - any-glob-to-any-file: 'gradle/**'
 
 'type: android':
-  - '**/AndroidManifest.xml'
-  - '**/*.xml'
-  - 'app/src/main/res/**'
-  - 'app/proguard-rules.pro'
+  - changed-files:
+    - any-glob-to-any-file: '**/AndroidManifest.xml'
 
 'type: kotlin':
-  - '**/*.kt'
+  - changed-files:
+    - any-glob-to-any-file: '**/*.kt'
