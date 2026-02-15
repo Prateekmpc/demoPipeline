@@ -122,7 +122,7 @@ android {
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // -------- DataDog + AWS --------
+        // -------- DataDog + AWS -------------
         buildConfigField("String", "DATA_DOG_CLIENT_TOKEN", "\"${getSecureProperty("DATA_DOG_CLIENT_TOKEN")}\"")
         buildConfigField("String", "DATA_DOG_APPLICATION_ID", "\"${getSecureProperty("DATA_DOG_APPLICATION_ID")}\"")
         buildConfigField("String", "AWS_ACCESS_KEY", "\"${getSecureProperty("AWS_ACCESS_KEY")}\"")
