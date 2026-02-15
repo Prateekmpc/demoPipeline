@@ -1,0 +1,249 @@
+name: Build & Upload Android APK (RC/GA)
+
+on:
+  push:
+    branches:
+      - 'release/**'      # e.g. release/verizon/1.38 or release/verizon/1.38.1
+      - 'prod/**'         # e.g. prod/verizon-latest
+    tags:
+      - '*-*-rc*'         # e.g. verizon-1.38-rc2
+      - '*-*'             # e.g. verizon-1.38 or verizon-1.38.1
+  workflow_dispatch:
+
+# Avoid overlapping runs per ref
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # required for AWS OIDC once implemented
+  contents: read
+
+jobs:
+  build-upload:
+    runs-on: ubuntu-latest
+    env:
+      APK_S3_BUCKET: ${{ secrets.APK_S3_BUCKET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Accept licenses & install SDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "cmdline-tools;latest"
+          # Optional sanity checks
+          ls -la "$ANDROID_SDK_ROOT/build-tools/33.0.2/" || true
+          ls -la "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/" || true
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Recreate keystore from secret
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_KEYSTORE_BASE64:-}" || { echo "Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/daisy.jks"
+
+      - name: Build production release (signed)
+        env:
+          ANDROID_KEYSTORE_PASSWORD:  ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS:          ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:clean :app:assembleProductionRelease \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/daisy.jks" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_ALIAS_PASSWORD"
+
+      - name: Locate outputs
+        id: out
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/production/release/*.apk 2>/dev/null | head -n1 || true)
+          if [[ -z "$APK" ]]; then
+            APK=$(ls app/build/outputs/apk/**/release/*.apk 2>/dev/null | head -n1 || true)
+          fi
+          test -n "$APK" || { echo "APK not found"; exit 1; }
+          MAP=$(ls app/build/outputs/mapping/productionRelease/mapping.txt 2>/dev/null || true)
+          echo "apk=$APK" >> $GITHUB_OUTPUT
+          echo "mapping=$MAP" >> $GITHUB_OUTPUT
+
+      - name: Derive S3 keys
+        id: key
+        env:
+          S3_BASE: android
+        run: |
+          set -euo pipefail
+          ref="$GITHUB_REF_NAME"
+          sha7="${GITHUB_SHA::7}"
+          channel="release"; slug="unknown"; version="0.0"; rc="rc-untagged"; variant="productionRelease"
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Tags: <slug>-<MAJOR.MINOR(.PATCH optional)>-rcN  OR  <slug>-<MAJOR.MINOR(.PATCH)>
+            if [[ "$ref" =~ ^([a-z0-9._+-]+)-([0-9]+\.[0-9]+(\.[0-9]+)?)\-rc([0-9]+)$ ]]; then
+              slug="${BASH_REMATCH[1]}"; version="${BASH_REMATCH[2]}"; rc="rc${BASH_REMATCH[4]}"; channel="release"
+            elif [[ "$ref" =~ ^([a-z0-9._+-]+)-([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+              slug="${BASH_REMATCH[1]}"; version="${BASH_REMATCH[2]}"; channel="prod"; rc="ga"
+            fi
+          else
+            # Branches: release/<slug>/<MAJOR.MINOR(.PATCH)?>  OR  prod/<slug>-latest
+            if [[ "$ref" =~ ^release/([^/]+)/([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+              slug="${BASH_REMATCH[1]}"; version="${BASH_REMATCH[2]}"; channel="release"; rc="rc-untagged"
+            elif [[ "$ref" =~ ^prod/([^/]+)-latest$ ]]; then
+              slug="${BASH_REMATCH[1]}"; version="latest"; channel="prod"; rc="ga"
+            fi
+          fi
+
+          if [[ "$channel" == "release" ]]; then
+            BASE="${S3_BASE}/${slug}/release/${version}/${rc}/${sha7}"
+          else
+            if [[ "$version" == "latest" ]]; then
+              BASE="${S3_BASE}/${slug}/prod/latest"
+            else
+              BASE="${S3_BASE}/${slug}/prod/${version}/ga/${sha7}"
+            fi
+          fi
+
+          name_apk="${slug}-v${version}-${rc}-${variant}-${sha7}.apk"
+
+          echo "base=$BASE"         >> $GITHUB_OUTPUT
+          echo "name_apk=$name_apk" >> $GITHUB_OUTPUT
+          echo "slug=$slug"         >> $GITHUB_OUTPUT
+          echo "version=$version"   >> $GITHUB_OUTPUT
+          echo "rc=$rc"             >> $GITHUB_OUTPUT
+          echo "variant=$variant"   >> $GITHUB_OUTPUT
+
+      - name: Validate ref parsing
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.key.outputs.slug }}" == "unknown" ]]; then
+            echo "Failed to parse slug/version from ref '${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}'"
+            exit 1
+          fi
+
+      - name: Check S3 bucket secret
+        run: |
+          set -euo pipefail
+          test -n "${APK_S3_BUCKET:-}" || { echo "Missing APK_S3_BUCKET secret"; exit 1; }
+
+      - name: Extract version info from APK
+        id: meta
+        run: |
+          set -euo pipefail
+          APK="${{ steps.out.outputs.apk }}"
+
+          # Prefer aapt from the exact Build Tools version we installed
+          AAPT="$ANDROID_SDK_ROOT/build-tools/33.0.2/aapt"
+          if [[ ! -x "$AAPT" ]]; then
+            # Fallback to whatever is on PATH (if any)
+            AAPT="$(command -v aapt || true)"
+          fi
+
+          if [[ -x "${AAPT}" ]]; then
+            BADGING="$("${AAPT}" dump badging "$APK")"
+            VN="$(printf '%s\n' "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n1)"
+            VC="$(printf '%s\n' "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n1)"
+          else
+            # Final fallback: try apkanalyzer if present
+            APKANA="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+            if [[ ! -x "$APKANA" ]]; then APKANA="$(command -v apkanalyzer || true)"; fi
+            if [[ -x "$APKANA" ]]; then
+              VN="$("$APKANA" manifest print "$APK" | grep -oE 'versionName=\"?[^\" ]+' | cut -d= -f2 | tr -d '"')"
+              VC="$("$APKANA" manifest print "$APK" | grep -oE 'versionCode=[0-9]+' | cut -d= -f2)"
+            else
+              echo "Neither aapt nor apkanalyzer found. Ensure build-tools or cmdline-tools are installed."
+              exit 1
+            fi
+          fi
+
+          if [[ -z "${VN:-}" || -z "${VC:-}" ]]; then
+            echo "Failed to extract version info from $APK"
+            exit 1
+          fi
+
+          echo "vn=$VN" >> "$GITHUB_OUTPUT"
+          echo "vc=$VC" >> "$GITHUB_OUTPUT"
+
+      - name: Build checksums & meta
+        id: files
+        run: |
+          set -euo pipefail
+          mkdir -p out/checksums out/meta out/changelog out/mapping
+          sha256sum "${{ steps.out.outputs.apk }}" > out/checksums/SHA256SUMS
+          cat > out/meta/build.json <<EOF
+          {
+            "slug": "${{ steps.key.outputs.slug }}",
+            "version": "${{ steps.key.outputs.version }}",
+            "release_class": "${{ steps.key.outputs.rc }}",
+            "git_sha": "${GITHUB_SHA}",
+            "git_ref": "${GITHUB_REF}",
+            "artifact": "${{ steps.key.outputs.name_apk }}",
+            "versionName": "${{ steps.meta.outputs.vn }}",
+            "versionCode": "${{ steps.meta.outputs.vc }}",
+            "builtAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          }
+          EOF
+          if [[ -f CHANGELOG.md && "${{ steps.key.outputs.version }}" != "latest" ]]; then
+            awk -v ver="${{ steps.key.outputs.version }}" '
+              BEGIN{p=0}
+              /^##[[:space:]]+/{if(p) exit}
+              $0 ~ "^##[[:space:]]+"ver {p=1}
+              p{print}
+            ' CHANGELOG.md > "out/changelog/CHANGELOG-${{ steps.key.outputs.version }}.md" || true
+          fi
+          if [[ -n "${{ steps.out.outputs.mapping }}" && -f "${{ steps.out.outputs.mapping }}" ]]; then
+            cp "${{ steps.out.outputs.mapping }}" out/mapping/mapping.txt
+          fi
+
+      # Using static AWS keys (from repo/org secrets). Consider OIDC later.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Upload to S3 (structured)
+        run: |
+          set -euo pipefail
+          ROOT="s3://${{ env.APK_S3_BUCKET }}/${{ steps.key.outputs.base }}"
+          aws s3 cp "${{ steps.out.outputs.apk }}" "$ROOT/apk/${{ steps.key.outputs.name_apk }}" --only-show-errors
+          if [[ -f out/checksums/SHA256SUMS ]]; then aws s3 cp out/checksums/SHA256SUMS "$ROOT/checksums/SHA256SUMS" --only-show-errors; fi
+          if [[ -f out/meta/build.json ]]; then aws s3 cp out/meta/build.json "$ROOT/meta/build.json" --only-show-errors; fi
+          if [[ -f "out/changelog/CHANGELOG-${{ steps.key.outputs.version }}.md" ]]; then
+            aws s3 cp "out/changelog/CHANGELOG-${{ steps.key.outputs.version }}.md" "$ROOT/changelog/CHANGELOG-${{ steps.key.outputs.version }}.md" --only-show-errors
+          fi
+          if [[ -f out/mapping/mapping.txt ]]; then aws s3 cp out/mapping/mapping.txt "$ROOT/mapping/mapping.txt" --only-show-errors; fi
+
+      - name: Update prod latest pointer
+        if: ${{ startsWith(github.ref, 'refs/heads/prod/') && endsWith(github.ref_name, '-latest') }}
+        run: |
+          set -euo pipefail
+          LATEST_ROOT="s3://${{ env.APK_S3_BUCKET }}/android/${{ steps.key.outputs.slug }}/prod/latest"
+          aws s3 cp "${{ steps.out.outputs.apk }}" "$LATEST_ROOT/apk/${{ steps.key.outputs.slug }}-latest.apk" --only-show-errors
+          aws s3 cp out/meta/build.json "$LATEST_ROOT/meta/build.json" --only-show-errors
+          sha256sum "${{ steps.out.outputs.apk }}" > SHA256SUMS
+          aws s3 cp SHA256SUMS "$LATEST_ROOT/checksums/SHA256SUMS" --only-show-errors
+          rm -f SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.key.outputs.slug }}-${{ steps.key.outputs.version }}-${{ steps.key.outputs.rc }}"
+          path: |
+            ${{ steps.out.outputs.apk }}
+            out/**

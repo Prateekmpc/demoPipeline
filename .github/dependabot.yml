@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # Android/Gradle deps
+  - package-ecosystem: "gradle"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+
+    # ok to keep semver-style here
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+    groups:
+      android-core:
+        patterns:
+          - "androidx.*"
+          - "com.google.*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      square-okhttp-moshi:
+        patterns:
+          - "com.squareup.okhttp3:*"
+          - "com.squareup.moshi:*"
+        update-types:
+          - "minor"
+          - "patch"
+
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Keep GitHub Actions up to date
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
