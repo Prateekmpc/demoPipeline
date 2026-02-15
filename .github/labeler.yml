@@ -1,25 +1,30 @@
+app:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'app/**'
 
+data:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'data/**'
 
-name: PR Labeler
-on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+domain:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'domain/**'
 
-permissions:
-  contents: read
-  pull-requests: write
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
 
-jobs:
-  label:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
 
-      - uses: actions/labeler@v6
-        with:
-          configuration-path: .github/labeler.yml
-          sync-labels: true
-          dot: true
-
+gradle:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.gradle'
+          - '**/*.gradle.kts'
