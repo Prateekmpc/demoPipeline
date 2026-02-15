@@ -1,30 +1,33 @@
-app:
+"area:app":
   - changed-files:
       - any-glob-to-any-file:
-          - 'app/**'
+          - app/**
+          - app/src/**
 
-data:
+"area:ci":
   - changed-files:
       - any-glob-to-any-file:
-          - 'data/**'
+          - .github/workflows/**
+          - .github/actions/**
 
-domain:
+"area:infra":
   - changed-files:
       - any-glob-to-any-file:
-          - 'domain/**'
+          - .github/**
+          - "! .github/workflows/**"
 
-ci:
+"release-notes":
   - changed-files:
-      - any-glob-to-any-file:
-          - '.github/**'
+      - any-glob-to-any-file: CHANGELOG.md
 
-docs:
+"area:gradle":
   - changed-files:
       - any-glob-to-any-file:
-          - '**/*.md'
-
-gradle:
-  - changed-files:
-      - any-glob-to-any-file:
-          - '**/*.gradle'
-          - '**/*.gradle.kts'
+          - app/build.gradle
+          - app/build.gradle.kts
+          - build.gradle
+          - build.gradle.kts
+          - settings.gradle
+          - settings.gradle.kts
+          - gradle.properties
+          - gradle/**
