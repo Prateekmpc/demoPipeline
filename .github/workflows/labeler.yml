@@ -14,9 +14,3 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-
-      - uses: actions/labeler@v6
-        with:
-          configuration-path: .github/labeler.yml
-          sync-labels: true
-          dot: true
