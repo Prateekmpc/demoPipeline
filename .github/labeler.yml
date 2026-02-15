@@ -1,29 +1,25 @@
-"area:app":
-  - changed-files:
-      - any-glob-to-any-file:
-          - app/**
-          - app/src/**
 
-"area:ci":
-  - changed-files:
-      - any-glob-to-any-file:
-          - .github/workflows/**
-          - .github/actions/**
 
-"area:infra":
-  - changed-files:
-      - any-glob-to-any-file:
-          - .github/**
-          - "!/.github/workflows/**"
+name: PR Labeler
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
 
-"release-notes":
-  - changed-files:
-      - any-glob-to-any-file: CHANGELOG.md
+permissions:
+  contents: read
+  pull-requests: write
 
-"gradle":
-  - changed-files:
-      - any-glob-to-any-file:
-          - app/build.gradle
-          - app/build.gradle.kts
-          - gradle/**
-          - gradle.*
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - uses: actions/labeler@v6
+        with:
+          configuration-path: .github/labeler.yml
+          sync-labels: true
+          dot: true
+
