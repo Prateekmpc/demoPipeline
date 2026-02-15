@@ -1,3 +1,13 @@
+name: Labeler
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   label:
     runs-on: ubuntu-latest
@@ -8,7 +18,3 @@ jobs:
         uses: actions/labeler@v4
         with:
           configuration-path: .github/labeler.yml
-
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
