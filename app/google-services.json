@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "518623920875",
+    "firebase_url": "https://daisy-34c00app.firebaseio.com",
+    "project_id": "daisy-34c00app",
+    "storage_bucket": "daisy-34c00app.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:518623920875:android:086e855e9394f153a5f4ae",
+        "android_client_info": {
+          "package_name": "com.daisy"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "518623920875-0a3ohbpt4nnipe5drfc9dm72e0smatev.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.daisy",
+            "certificate_hash": "40b180ae2b8caf8d24bbca197bd444f0615c7b39"
+          }
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBdsg7Z9GdDcWqFrip3TySLIB05OmKlAjM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
