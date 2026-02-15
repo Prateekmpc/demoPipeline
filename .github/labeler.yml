@@ -1,38 +1,29 @@
-# Labeler configuration for automatic PR labeling based on changed files
-# Format required for actions/labeler@v6
+"area:app":
+  - changed-files:
+      - any-glob-to-any-file:
+          - app/**
+          - app/src/**
 
-'area: app':
+"area:ci":
   - changed-files:
-    - any-glob-to-any-file: 'app/**'
+      - any-glob-to-any-file:
+          - .github/workflows/**
+          - .github/actions/**
 
-'area: data':
+"area:infra":
   - changed-files:
-    - any-glob-to-any-file: 'data/**'
+      - any-glob-to-any-file:
+          - .github/**
+          - "!/.github/workflows/**"
 
-'area: domain':
+"release-notes":
   - changed-files:
-    - any-glob-to-any-file: 'domain/**'
+      - any-glob-to-any-file: CHANGELOG.md
 
-'area: ci':
+"gradle":
   - changed-files:
-    - any-glob-to-any-file: '.github/**'
-
-'area: docs':
-  - changed-files:
-    - any-glob-to-any-file: '*.md'
-
-'area: build':
-  - changed-files:
-    - any-glob-to-any-file: 'build.gradle.kts'
-  - changed-files:
-    - any-glob-to-any-file: 'settings.gradle.kts'
-  - changed-files:
-    - any-glob-to-any-file: 'gradle/**'
-
-'type: android':
-  - changed-files:
-    - any-glob-to-any-file: '**/AndroidManifest.xml'
-
-'type: kotlin':
-  - changed-files:
-    - any-glob-to-any-file: '**/*.kt'
+      - any-glob-to-any-file:
+          - app/build.gradle
+          - app/build.gradle.kts
+          - gradle/**
+          - gradle.*
